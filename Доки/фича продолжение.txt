@@ -1,0 +1,190 @@
+Отлично — тогда main действительно становится **веткой лидера**, и правило “только лидер пишет в main” получается очень естественным: **main = conversation, owner = leader**. Это сильно упрощает и права, и UX.
+
+Ниже — лучший (и самый реализуемый на OpenWebUI) дизайн: **ветки = conversations**, selective-merge = **pull-only import фактов/кусочков**. Всё строго проверяется на бэке (UI только помогает, но не является защитой).
+
+---
+
+## 1) Роли и права (итоговая модель)
+
+### Сущности
+- Workspace
+- Main branch = `workspace.main_conversation_id` (это ветка лидера)
+- Branch = обычный conversation OpenWebUI
+- Owner branch = пользователь-владелец ветки
+
+### Правила
+1) **Писать в main может только лидер**
+   - если `conversation_id == workspace.main_conversation_id` и `user_id != workspace.owner_user_id` → **403**
+   - UI дополнительно делает input disabled, но *решает бэк*.
+
+2) **Selective-merge только “pull к себе”**
+   - пользователь может импортировать из чужой ветки **только в свою ветку**
+   - запрет “из своей ветки в чужую” достигается одним правилом:
+     - target conversation должен принадлежать текущему пользователю (owner)
+   - лидер, будучи владельцем main, может “pull” в main (это и нужно, чтобы main собирал результаты команды)
+
+3) Просмотр:
+   - все участники workspace видят main read-only (кроме лидера)
+   - каждый видит чужие ветки read-only (если хотите), либо только через “Import” интерфейс
+
+---
+
+## 2) Как это сделать на OpenWebUI (не ломая core)
+
+### Ключевой принцип
+**Ветка = существующий conversation OpenWebUI.**  
+Никаких “деревьев сообщений внутри одного чата”.
+
+Это дает:
+- максимальная совместимость с OpenWebUI
+- минимум изменений UI/хранилища
+- ветвление = “создать новый conversation, скопировав историю до точки”
+
+---
+
+## 3) Минимальные таблицы/поля (в вашей БД)
+
+### Workspace
+- `workspaces(id, name, owner_user_id, main_conversation_id, created_at, …)`
+
+### Membership
+- `workspace_members(workspace_id, user_id, role)`  
+  (admin/editor/viewer; лидер = owner_user_id, обычно admin)
+
+### Связь conversation → workspace
+- `conversation_workspace(conversation_id, workspace_id)`
+
+### Владелец ветки
+- `conversation_owner(conversation_id, owner_user_id)`  
+  (для main owner_user_id = workspace.owner_user_id)
+
+### Ветки/родство (для навигации)
+- `conversation_branches(child_conversation_id, parent_conversation_id, fork_message_id, workspace_id, created_by, created_at)`
+
+### Память/факты (для selective-merge)
+Рекомендую хранить факты как сущности + embeddings (pgvector или chroma):
+- `memory_items(id, scope, workspace_id, conversation_id, text, embedding, source_message_id, created_by, created_at, tags, …)`
+  - scope: `conversation | workspace | user`
+
+### Аудит merge
+- `memory_merges(id, workspace_id, source_conversation_id, target_conversation_id, memory_item_ids, created_by, created_at, note, …)`
+
+---
+
+## 4) Selective-merge: “cherry-pick фактов” (лучший вариант)
+
+### Что импортируем
+Лучшее для управляемости и качества — импортировать **факты (MemoryItems)**, а не сообщения:
+- не раздувается чат
+- видно, что импортировано
+- можно дедуплицировать
+
+### Откуда берём факты в ветке
+1) **Автоизвлечение** после ответов ассистента:
+   - prompt: “Из диалога извлеки факты/решения/предпочтения, которые стоит запомнить”
+   - сохраняем в `scope=conversation, conversation_id=<branch>`
+2) + (опционально) ручное “Запомнить” на сообщении
+
+### Merge операция (важные проверки)
+Endpoint merge делает:
+- проверка workspace membership
+- проверка owner на target:
+  - `target_owner == current_user` (это и есть ваш запрет “не могу слить в чужую”)
+- проверка доступа к source (в рамках workspace)
+- дедуп по embedding similarity (например > 0.95)
+- копирование фактов в target `scope=conversation`
+- запись в `memory_merges`
+- (опционально) добавление “merge commit message” в target чат:
+  - “Imported 7 facts from ветка Анны” + `router.sources[]`
+
+### Как это выглядит для лидера
+Лидер в main нажимает “Import from branch” → выбирает чужую ветку → выделяет факты → импортирует в main.  
+Другие участники могут импортировать к себе (в свои ветки), но **не в main**, потому что target не их.
+
+---
+
+## 5) Workspace memory (общая) — рекомендую как “канон”
+Чтобы “главная” память была единой и не засорялась:
+
+- `scope=workspace` память **заполняет только лидер** (или только admin)
+- в каждом ответе модели можно подмешивать:
+  - `branch memory` (conversation)
+  - + `workspace memory` (read-only для всех)
+
+Тогда:
+- команда читает “канон”
+- лидер контролирует, что стало “общим знанием”
+- selective-merge в main может автоматически предлагать “добавить эти факты в workspace memory” (чекбокс)
+
+---
+
+## 6) UX: как это выглядит в интерфейсе
+
+### Main ветка (для не-лидера)
+- Banner: “Main branch (read-only). Только лидер может писать.”
+- Поле ввода disabled
+- Кнопка: “Создать мою ветку” (или “Перейти в мою ветку” если уже есть)
+- Кнопка “Import from branch” скрыта (потому что target=main, owner≠user)
+
+### Ветка пользователя
+- обычный чат
+- кнопка: “Import from branch”
+- вкладка/панель: “Facts” (список фактов ветки)
+- кнопка: “Merge selected facts”
+- Target выбирать **не даём** (или даём только свои ветки, если пользователь имеет несколько)
+
+### Навигация по веткам
+- простой список “Branches”:
+  - main (замочек / crown)
+  - моя ветка (highlight)
+  - чужие ветки (read-only)
+- (опционально) ползунок/таймлайн по запросам внутри текущего чата
+
+---
+
+## 7) Ползунок (навигация по запросам) — да, можно и это реально полезно
+
+### Самый быстрый вариант (без форка)
+JS-инъекция “Timeline slider”:
+- находит все сообщения `role=user`
+- рисует справа вертикальный слайдер с N маркерами
+- drag/клик → `scrollIntoView` нужного user-поста
+- tooltip с превью текста запроса
+
+Это можно сделать полностью независимо от внутренних API, работая по DOM + `MutationObserver` (SPA обновления).
+
+### Надежный вариант (форк UI)
+Добавить компонент в правый сайдбар/toolbar OpenWebUI. Это стабильно на долгую.
+
+---
+
+## 8) Что важно реализовать на бэке (чтобы всё было “железно”)
+
+1) **Guard на отправку сообщений**
+- если чат привязан к workspace и это `main_conversation_id`:
+  - `if user_id != workspace.owner_user_id: return 403`
+
+2) **Guard на selective-merge**
+- `target_conversation.owner_user_id == current_user_id` — обязательное правило
+- source — только в рамках workspace
+
+3) **UI не считается защитой**
+- даже если кнопки скрыты, API должен запрещать
+
+---
+
+## 9) Рекомендованный “best effort” план внедрения
+1) Таблицы: workspace + members + conversation_workspace + conversation_owner  
+2) Main read-only enforcement (403) + UI disable  
+3) Branch creation (новый conversation + branch link)  
+4) Memory per conversation (факты) + список фактов  
+5) Selective-merge facts + audit + optional merge-commit message  
+6) Ползунок по запросам (инъекцией или форком)
+
+---
+
+Если хочешь, я предложу точные изменения в Swagger “вставь сюда” для:
+- `GET /memory?conversationId=...` (листинг фактов ветки),
+- `POST /memory/merge` (pull-only),
+- `GET /workspaces/{id}/main` и `GET /workspaces/{id}/branches` (навигация),
+и отдельно — какие ответы/коды нужны для понятного UX (403 + reason).
